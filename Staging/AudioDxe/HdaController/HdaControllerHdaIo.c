@@ -25,6 +25,37 @@
 #include "HdaController.h"
 #include <IndustryStandard/HdaRegisters.h>
 
+STATIC
+UINT32
+HdaControllerCopyToRing (
+  IN HDA_STREAM  *HdaStream,
+  IN UINT32      Position,
+  IN CONST UINT8 *Source,
+  IN UINT32      Length
+  )
+{
+  UINT32  CurrentPosition;
+  UINT32  CopyLength;
+
+  CurrentPosition = Position % HDA_STREAM_BUF_SIZE;
+  while (Length > 0) {
+    CopyLength = HDA_STREAM_BUF_SIZE - CurrentPosition;
+    if (CopyLength > Length) {
+      CopyLength = Length;
+    }
+
+    CopyMem (HdaStream->BufferData + CurrentPosition, Source, CopyLength);
+    Source          += CopyLength;
+    Length          -= CopyLength;
+    CurrentPosition += CopyLength;
+    if (CurrentPosition == HDA_STREAM_BUF_SIZE) {
+      CurrentPosition = 0;
+    }
+  }
+
+  return CurrentPosition;
+}
+
 // HDA I/O Device Path GUID.
 EFI_GUID  gEfiHdaIoDevicePathGuid = EFI_HDA_IO_DEVICE_PATH_GUID;
 
@@ -139,6 +170,7 @@ HdaControllerHdaIoSetupStream (
   // Stream.
   HDA_STREAM  *HdaStream;
   UINT16      HdaStreamFormat;
+  UINT16      HdaStreamFormatReadback;
   UINT8       HdaStreamId;
   EFI_TPL     OldTpl = 0;
 
@@ -151,6 +183,7 @@ HdaControllerHdaIoSetupStream (
   HdaIoPrivateData = HDA_IO_PRIVATE_DATA_FROM_THIS (This);
   HdaControllerDev = HdaIoPrivateData->HdaControllerDev;
   PciIo            = HdaControllerDev->PciIo;
+  HdaStreamFormatReadback = 0;
 
   // Get stream.
   if (Type == EfiHdaIoTypeOutput) {
@@ -207,7 +240,6 @@ HdaControllerHdaIoSetupStream (
   if (Format != HdaStreamFormat) {
     // Reset stream.
     DEBUG ((DEBUG_VERBOSE, "HdaControllerHdaIoSetupStream(): format changed, resetting stream\n"));
-    HdaControllerDev->DmaPositions[HdaStream->Index].Position = 0;
     if (!HdaControllerResetStream (HdaStream)) {
       Status = EFI_INVALID_PARAMETER;
       goto DONE;
@@ -232,6 +264,34 @@ HdaControllerHdaIoSetupStream (
                         1,
                         &Format
                         );
+  if (EFI_ERROR (Status)) {
+    HdaControllerDiagnosticLog (
+      HdaControllerDev,
+      "setup stream=%u SDNFMT write=0x%04X read=0x%04X write_status=0x%08X\n",
+      HdaStream->Index,
+      Format,
+      HdaStreamFormatReadback,
+      (UINT32)Status
+      );
+    goto DONE;
+  }
+
+  Status = PciIo->Mem.Read (
+                        PciIo,
+                        EfiPciIoWidthUint16,
+                        PCI_HDA_BAR,
+                        HDA_REG_SDNFMT (HdaStream->Index),
+                        1,
+                        &HdaStreamFormatReadback
+                        );
+  HdaControllerDiagnosticLog (
+    HdaControllerDev,
+    "setup stream=%u SDNFMT write=0x%04X read=0x%04X read_status=0x%08X\n",
+    HdaStream->Index,
+    Format,
+    HdaStreamFormatReadback,
+    (UINT32)Status
+    );
   if (EFI_ERROR (Status)) {
     goto DONE;
   }
@@ -389,9 +449,10 @@ HdaControllerHdaIoStartStream (
   UINT8       HdaStreamId;
   UINT16      HdaStreamSts;
   UINT32      HdaStreamDmaPos;
-  UINT32      HdaStreamDmaRemainingLength;
-  UINT32      HdaStreamCurrentBlock;
-  UINT32      HdaStreamNextBlock;
+  UINT32      HdaStreamLinkPos;
+  UINT32      SourceLength;
+  UINT32      CurrentPosition;
+  UINT32      LinkAdvanced;
 
   // If a parameter is invalid, return error.
   if ((This == NULL) || (Type >= EfiHdaIoTypeMaximum) ||
@@ -422,6 +483,105 @@ HdaControllerHdaIoStartStream (
     return EFI_NOT_READY;
   }
 
+  // Once an asynchronous transfer reaches its lead point, keep the HDA
+  // engine running and append the next source directly to the DMA ring.
+  if (HdaStream->StreamRunning) {
+    if (HdaStream->BufferActive) {
+      DEBUG ((
+        DEBUG_WARN,
+        "HDA: StartStream rejected while transfer active, length 0x%X\n",
+        BufferLength
+        ));
+      return EFI_ALREADY_STARTED;
+    }
+
+    SourceLength = (UINT32)BufferLength - (UINT32)BufferPosition;
+    if ((SourceLength == 0) ||
+        (SourceLength > HDA_STREAM_BUF_SIZE - HdaStream->BufferQueuedLength))
+    {
+      return EFI_OUT_OF_RESOURCES;
+    }
+
+    Status = PciIo->Mem.Read (
+                          PciIo,
+                          EfiPciIoWidthFifoUint32,
+                          PCI_HDA_BAR,
+                          HDA_REG_SDNLPIB (HdaStream->Index),
+                          1,
+                          &HdaStreamLinkPos
+                          );
+    if (EFI_ERROR (Status)) {
+      return EFI_INVALID_PARAMETER;
+    }
+
+    if (!HdaControllerGetStreamDmaPos (HdaStream, HdaStreamLinkPos, &HdaStreamDmaPos)) {
+      return EFI_INVALID_PARAMETER;
+    }
+
+    if (HdaStreamLinkPos >= HdaStream->LinkPositionLast) {
+      LinkAdvanced = HdaStreamLinkPos - HdaStream->LinkPositionLast;
+    } else {
+      LinkAdvanced = (HDA_STREAM_BUF_SIZE - HdaStream->LinkPositionLast) + HdaStreamLinkPos;
+    }
+
+    if (LinkAdvanced >= HdaStream->BufferQueuedLength) {
+      HdaStream->BufferQueuedLength = 0;
+    } else {
+      HdaStream->BufferQueuedLength -= LinkAdvanced;
+    }
+
+    // The write tail is software-owned.  Do not reset it to LPIB when the
+    // accounting cursor temporarily reaches zero: on physical controllers
+    // LPIB may lag behind the DMA engine and would move the producer back into
+    // data that has already been prefetched.  The poll path synchronises this
+    // tail to LPIB only while the running stream is genuinely idle.
+    CurrentPosition = HdaStream->BufferWritePosition;
+    HdaStream->BufferWritePosition = CurrentPosition;
+    HdaStream->BufferWritePosition = HdaControllerCopyToRing (
+                                       HdaStream,
+                                       CurrentPosition,
+                                       (CONST UINT8 *)Buffer + BufferPosition,
+                                       SourceLength
+                                       );
+    HdaStream->BufferQueuedLength += SourceLength;
+
+    HdaStream->BufferSource         = Buffer;
+    HdaStream->BufferSourceLength   = SourceLength;
+    HdaStream->BufferSourcePosition = SourceLength;
+    HdaStream->Callback             = Callback;
+    HdaStream->CallbackContext1     = Context1;
+    HdaStream->CallbackContext2     = Context2;
+    HdaStream->CallbackContext3     = Context3;
+    HdaStream->DmaPositionLast      = HdaStreamDmaPos;
+    HdaStream->DmaPositionTotal     = 0;
+    HdaStream->DiagnosticPollCount  = 0;
+    HdaStream->LinkPositionLast     = HdaStreamLinkPos;
+    HdaStream->LinkPositionTotal    = 0;
+    HdaStream->BufferActive         = TRUE;
+    HdaStream->BufferSilent         = FALSE;
+    DEBUG ((
+      DEBUG_INFO,
+      "HDA: Append len 0x%X at 0x%X next 0x%X lpib 0x%X queued 0x%X\n",
+      SourceLength,
+      CurrentPosition,
+      HdaStream->BufferWritePosition,
+      HdaStreamLinkPos,
+      HdaStream->BufferQueuedLength
+      ));
+    HdaControllerDiagnosticLog (
+      HdaControllerDev,
+      "append stream=%u length=0x%X write_start=0x%X write_end=0x%X LPIB=0x%08X DMA=0x%08X queued=0x%X\n",
+      HdaStream->Index,
+      SourceLength,
+      CurrentPosition,
+      HdaStream->BufferWritePosition,
+      HdaStreamLinkPos,
+      HdaStreamDmaPos,
+      HdaStream->BufferQueuedLength
+      );
+    return EFI_SUCCESS;
+  }
+
   // Reset completion bit.
   HdaStreamSts = HDA_REG_SDNSTS_BCIS;
   Status       = PciIo->Mem.Write (PciIo, EfiPciIoWidthUint8, PCI_HDA_BAR, HDA_REG_SDNSTS (HdaStream->Index), 1, &HdaStreamSts);
@@ -429,22 +589,35 @@ HdaControllerHdaIoStartStream (
     return Status;
   }
 
-  //
-  // Get current stream position through either LPIB or DMA positions buffer.
-  // LPIB fallback will occur if DMA positions buffer does not update (i.e. non-Intel controllers).
-  //
-  if (HdaStream->UseLpib) {
-    Status = PciIo->Mem.Read (PciIo, EfiPciIoWidthFifoUint32, PCI_HDA_BAR, HDA_REG_SDNLPIB (HdaStream->Index), 1, &HdaStreamDmaPos);
-    if (EFI_ERROR (Status)) {
-      return EFI_INVALID_PARAMETER;
-    }
-  } else {
-    HdaStreamDmaPos = HdaStream->HdaDev->DmaPositions[HdaStream->Index].Position;
+  // Read the single playback cursor used by both QEMU and physical HDA.
+  Status = PciIo->Mem.Read (
+                        PciIo,
+                        EfiPciIoWidthFifoUint32,
+                        PCI_HDA_BAR,
+                        HDA_REG_SDNLPIB (HdaStream->Index),
+                        1,
+                        &HdaStreamLinkPos
+                        );
+  if (EFI_ERROR (Status)) {
+    return EFI_INVALID_PARAMETER;
   }
 
-  HdaStreamCurrentBlock = HdaStreamDmaPos / HDA_BDL_BLOCKSIZE;
-  HdaStreamNextBlock    = HdaStreamCurrentBlock + 1;
-  HdaStreamNextBlock   %= HDA_BDL_ENTRY_COUNT;
+  if (!HdaControllerGetStreamDmaPos (HdaStream, HdaStreamLinkPos, &HdaStreamDmaPos)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  // These counters describe this finite transfer, not the previous one.
+  // Keeping the old DmaPositionLast can make DmaPositionTotal jump over the
+  // completion threshold immediately after a restart.
+  HdaStream->DmaPositionLast       = HdaStreamDmaPos;
+  HdaStream->DmaPositionTotal      = 0;
+  HdaStream->DmaPositionChangedMax = 0;
+  HdaStream->DiagnosticPollCount   = 0;
+  HdaStream->DmaCheckCount         = 0;
+  HdaStream->DmaCheckComplete      = FALSE;
+  HdaStream->LinkPositionLast      = HdaStreamLinkPos;
+  HdaStream->LinkPositionTotal     = 0;
+
   DEBUG ((
     DEBUG_INFO,
     "HDA: Stream %u DMA pos 0x%X\n",
@@ -460,51 +633,33 @@ HdaControllerHdaIoStartStream (
   HdaStream->CallbackContext1     = Context1;
   HdaStream->CallbackContext2     = Context2;
   HdaStream->CallbackContext3     = Context3;
-  HdaStream->DmaPositionTotal     = 0;
+  HdaStream->BufferQueuedLength   = (UINT32)BufferLength - (UINT32)BufferPosition;
 
   // Zero out buffer.
   ZeroMem (HdaStream->BufferData, HDA_STREAM_BUF_SIZE);
 
-  // Fill rest of current block.
-  HdaStreamDmaRemainingLength = HDA_BDL_BLOCKSIZE - (HdaStreamDmaPos - (HdaStreamCurrentBlock * HDA_BDL_BLOCKSIZE));
-  if ((HdaStream->BufferSourcePosition + HdaStreamDmaRemainingLength) > HdaStream->BufferSourceLength ) {
-    HdaStreamDmaRemainingLength = HdaStream->BufferSourceLength  - HdaStream->BufferSourcePosition;
+  // Copy the complete initial transfer into the DMA ring before starting the
+  // engine.  Waiting for IOC polling to fill later BDL entries leaves zeros
+  // at startup when the first timer tick is delayed.
+  SourceLength = HdaStream->BufferSourceLength - HdaStream->BufferSourcePosition;
+  if (SourceLength > HDA_STREAM_BUF_SIZE) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto STOP_STREAM;
   }
+  HdaControllerCopyToRing (
+    HdaStream,
+    HdaStreamDmaPos,
+    HdaStream->BufferSource + HdaStream->BufferSourcePosition,
+    SourceLength
+    );
+  HdaStream->BufferSourcePosition = HdaStream->BufferSourceLength;
 
-  CopyMem (HdaStream->BufferData + HdaStreamDmaPos, HdaStream->BufferSource + HdaStream->BufferSourcePosition, HdaStreamDmaRemainingLength);
-  HdaStream->BufferSourcePosition += HdaStreamDmaRemainingLength;
-  DEBUG ((
-    DEBUG_VERBOSE,
-    "%u (0x%X) bytes written to 0x%X (block %u of %u)\n",
-    HdaStreamDmaRemainingLength,
-    HdaStreamDmaRemainingLength,
-    HdaStream->BufferData + HdaStreamDmaPos,
-    HdaStreamCurrentBlock,
-    HDA_BDL_ENTRY_COUNT
-    ));
-
-  // Fill next block.
-  if (HdaStream->BufferSourcePosition < HdaStream->BufferSourceLength) {
-    HdaStreamDmaRemainingLength = HDA_BDL_BLOCKSIZE;
-    if ((HdaStream->BufferSourcePosition + HdaStreamDmaRemainingLength) > HdaStream->BufferSourceLength) {
-      HdaStreamDmaRemainingLength = HdaStream->BufferSourceLength - HdaStream->BufferSourcePosition;
-    }
-
-    CopyMem (HdaStream->BufferData + (HdaStreamNextBlock * HDA_BDL_BLOCKSIZE), HdaStream->BufferSource + HdaStream->BufferSourcePosition, HdaStreamDmaRemainingLength);
-    HdaStream->BufferSourcePosition += HdaStreamDmaRemainingLength;
-    DEBUG ((
-      DEBUG_VERBOSE,
-      "%u (0x%X) bytes written to 0x%X (block %u of %u)\n",
-      HdaStreamDmaRemainingLength,
-      HdaStreamDmaRemainingLength,
-      HdaStream->BufferData + (HdaStreamNextBlock * HDA_BDL_BLOCKSIZE),
-      HdaStreamNextBlock,
-      HDA_BDL_ENTRY_COUNT
-      ));
-  }
+  HdaStream->BufferWritePosition =
+    (HdaStreamDmaPos + HdaStream->BufferQueuedLength) % HDA_STREAM_BUF_SIZE;
 
   // Setup polling timer.
   HdaStream->BufferActive = TRUE;
+  HdaStream->BufferSilent = FALSE;
   Status                  = gBS->SetTimer (HdaStream->PollTimer, TimerPeriodic, HDA_STREAM_POLL_TIME);
   if (EFI_ERROR (Status)) {
     goto STOP_STREAM;
@@ -516,6 +671,27 @@ HdaControllerHdaIoStartStream (
     goto STOP_STREAM;
   }
 
+  HdaStream->StreamRunning = TRUE;
+
+  DEBUG ((
+    DEBUG_INFO,
+    "HDA: StartStream running buffer %p length 0x%X position 0x%X queued 0x%X\n",
+    Buffer,
+    BufferLength,
+    BufferPosition,
+    HdaStream->BufferQueuedLength
+    ));
+
+  HdaControllerDiagnosticLog (
+    HdaControllerDev,
+    "start stream=%u length=0x%X position=0x%X LPIB=0x%08X DMA=0x%08X queued=0x%X\n",
+    HdaStream->Index,
+    BufferLength,
+    BufferPosition,
+    HdaStreamLinkPos,
+    HdaStreamDmaPos,
+    HdaStream->BufferQueuedLength
+    );
   return EFI_SUCCESS;
 
 STOP_STREAM:
@@ -577,7 +753,13 @@ HdaControllerHdaIoStopStream (
     return EFI_INVALID_PARAMETER;
   }
 
+  HdaStream->StreamRunning       = FALSE;
+  HdaStream->BufferQueuedLength  = 0;
+  HdaStream->BufferWritePosition = 0;
+
   // Remove source buffer pointer.
+  HdaStream->BufferActive         = FALSE;
+  HdaStream->BufferSilent         = FALSE;
   HdaStream->BufferSource         = NULL;
   HdaStream->BufferSourceLength   = 0;
   HdaStream->BufferSourcePosition = 0;

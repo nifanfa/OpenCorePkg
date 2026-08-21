@@ -44,12 +44,15 @@
   OcBootManagementLib
   OcDeviceMiscLib
   OcDevicePathLib
+  OcDriverConnectionLib
   OcFlexArrayLib
+  OcFileLib
   OcHdaDevicesLib
   OcMp3Lib
   OcStringLib
   OcWaveLib
   PcdLib
+  PrintLib
   UefiBootServicesTableLib
   UefiDriverEntryPoint
   UefiLib

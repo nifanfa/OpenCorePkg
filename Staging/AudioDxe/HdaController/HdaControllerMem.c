@@ -728,6 +728,11 @@ HdaControllerResetStream (
   HdaStream->DmaPositionTotal      = 0;
   HdaStream->DmaPositionLast       = 0;
   HdaStream->DmaPositionChangedMax = 0;
+  HdaStream->LinkPositionLast      = 0;
+  HdaStream->LinkPositionTotal     = 0;
+  HdaStream->StreamRunning         = FALSE;
+  HdaStream->BufferWritePosition   = 0;
+  HdaStream->BufferQueuedLength    = 0;
   HdaStream->UseLpib               = FALSE; // TODO: Allow being forced by NVRAM variable?
   HdaStream->DmaCheckCount         = 0;
   HdaStream->DmaCheckComplete      = FALSE;
@@ -1001,10 +1006,16 @@ HdaControllerStreamIdle (
   // Reset buffer information to idle stream.
   //
   HdaStream->BufferActive         = FALSE;
+  HdaStream->BufferSilent         = FALSE;
   HdaStream->BufferSource         = NULL;
   HdaStream->BufferSourcePosition = 0;
   HdaStream->BufferSourceLength   = 0;
+  HdaStream->StreamRunning        = FALSE;
+  HdaStream->BufferWritePosition  = 0;
+  HdaStream->BufferQueuedLength   = 0;
   HdaStream->DmaPositionTotal     = 0;
+  HdaStream->LinkPositionTotal    = 0;
+  HdaStream->DiagnosticPollCount  = 0;
 
   ZeroMem (HdaStream->BufferData, HDA_STREAM_BUF_SIZE);
 }
@@ -1016,13 +1027,18 @@ HdaControllerStreamAbort (
 {
   ASSERT (HdaStream != NULL);
 
-  HdaControllerStreamIdle (HdaStream);
-
   //
-  // Stop stream and timer.
+  // Stop polling before changing the stream state.  The DMA buffer must not
+  // be cleared while the controller can still fetch from it: doing so can
+  // replace the tail of the transfer with zeros before the codec has drained
+  // its FIFO.
   //
-  HdaControllerSetStreamState (HdaStream, FALSE);
   gBS->SetTimer (HdaStream->PollTimer, TimerCancel, 0);
+  HdaControllerSetStreamState (HdaStream, FALSE);
+
+  // The stream is stopped now, so it is safe to release and clear its source
+  // buffer state.
+  HdaControllerStreamIdle (HdaStream);
 
   // DEBUG ((DEBUG_INFO, "AudioDxe: Stream %u aborted!\n", HdaStream->Index));
 }

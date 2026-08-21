@@ -90,13 +90,25 @@ HdaCodecAudioIoGetOutputs (
 
   // Get output ports.
   for (UINTN i = 0; i < HdaCodecDev->OutputPortsCount; i++) {
+    UINT8 DefaultDevice;
+    UINT8 DefaultPortConnection;
+
     // Port is an output.
     HdaOutputPorts[i].Type = EfiAudioIoTypeOutput;
 
+    DefaultDevice         = HDA_VERB_GET_CONFIGURATION_DEFAULT_DEVICE (HdaCodecDev->OutputPorts[i]->DefaultConfiguration);
+    DefaultPortConnection = HDA_VERB_GET_CONFIGURATION_DEFAULT_PORT_CONN (HdaCodecDev->OutputPorts[i]->DefaultConfiguration);
+
     // Get device type.
-    switch (HDA_VERB_GET_CONFIGURATION_DEFAULT_DEVICE (HdaCodecDev->OutputPorts[i]->DefaultConfiguration)) {
+    // Do not advertise pins marked as having no physical connection as a
+    // normal analog output.  ALC897 exposes several input/digital pins with
+    // output capabilities, and selecting those produces a valid stream but
+    // no audible output.
+    if (DefaultPortConnection == HDA_CONFIG_DEFAULT_PORT_CONN_NONE) {
+      HdaOutputPorts[i].Device = EfiAudioIoDeviceOther;
+    } else {
+      switch (DefaultDevice) {
       case HDA_CONFIG_DEFAULT_DEVICE_LINE_OUT:
-      case HDA_CONFIG_DEFAULT_DEVICE_LINE_IN:
         HdaOutputPorts[i].Device = EfiAudioIoDeviceLine;
         break;
 
@@ -117,12 +129,18 @@ HdaCodecAudioIoGetOutputs (
         HdaOutputPorts[i].Device = EfiAudioIoDeviceMic;
         break;
 
+      case HDA_CONFIG_DEFAULT_DEVICE_LINE_IN:
+        HdaOutputPorts[i].Device = EfiAudioIoDeviceOther;
+        break;
+
       default:
         if (HdaCodecDev->OutputPorts[i]->PinCapabilities & HDA_PARAMETER_PIN_CAPS_HDMI) {
           HdaOutputPorts[i].Device = EfiAudioIoDeviceHdmi;
         } else {
           HdaOutputPorts[i].Device = EfiAudioIoDeviceOther;
         }
+        break;
+      }
     }
 
     // Get location.
@@ -341,6 +359,8 @@ HdaCodecAudioIoSetupPlayback (
   UINTN                  Index;
   UINT64                 IndexMask;
   UINT32                 Response;
+  UINT32                 ConverterFormat;
+  EFI_STATUS             ConverterStatus;
   UINT8                  NumGpios;
   UINT8                  ChannelPayload;
 
@@ -402,6 +422,7 @@ HdaCodecAudioIoSetupPlayback (
   StreamDiv       = 0;
   StreamMult      = 0;
   StreamBase44kHz = FALSE;
+  HdaStreamId     = 0;
 
   // Expand the requested stream frequency and sample size params,
   // and check that every requested channel can support them.
@@ -631,6 +652,13 @@ HdaCodecAudioIoSetupPlayback (
                 );
   DEBUG ((DEBUG_VERBOSE, "HdaCodecAudioIoPlay(): Stream format 0x%X\n", StreamFmt));
   Status = HdaIo->SetupStream (HdaIo, EfiHdaIoTypeOutput, StreamFmt, &HdaStreamId);
+  DEBUG ((
+    EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
+    "HDA: SetupStream format 0x%X -> id %u - %r\n",
+    StreamFmt,
+    HdaStreamId,
+    Status
+    ));
   if (EFI_ERROR (Status)) {
     return Status;
   }
@@ -642,9 +670,38 @@ HdaCodecAudioIoSetupPlayback (
     }
 
     Status = HdaCodecEnableWidgetPath (HdaCodecDev->OutputPorts[Index], Gain, HdaStreamId, StreamFmt);
+    DEBUG ((
+      EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
+      "HDA: EnableWidgetPath port %u node 0x%X - %r\n",
+      Index,
+      HdaCodecDev->OutputPorts[Index]->NodeId,
+      Status
+      ));
     if (EFI_ERROR (Status)) {
       goto CLOSE_STREAM;
     }
+
+    Status = HdaCodecGetOutputDac (HdaCodecDev->OutputPorts[Index], &OutputWidget);
+    if (EFI_ERROR (Status)) {
+      goto CLOSE_STREAM;
+    }
+
+    ConverterFormat = 0;
+    ConverterStatus = HdaIo->SendCommand (
+                                HdaIo,
+                                OutputWidget->NodeId,
+                                HDA_CODEC_VERB (HDA_VERB_GET_CONVERTER_FORMAT, 0),
+                                &ConverterFormat
+                                );
+    HdaControllerDiagnosticLogHdaIo (
+      HdaIo,
+      "dac node=0x%02X GET_CONVERTER_FORMAT=0x%08X requested_stream_format=0x%04X status=0x%08X\n",
+      OutputWidget->NodeId,
+      ConverterFormat,
+      StreamFmt,
+      (UINT32)ConverterStatus
+      );
+    HdaControllerDiagnosticFlushHdaIo (HdaIo);
   }
 
   //
@@ -740,6 +797,15 @@ HdaCodecAudioIoSetupPlayback (
     gBS->Stall (MS_TO_MICROSECONDS (PlaybackDelay));
   }
 
+  DEBUG ((
+    DEBUG_INFO,
+    "HDA: SetupPlayback outputs 0x%LX gain %d freq %u bits %u channels %u success\n",
+    OutputIndexMask,
+    Gain,
+    Freq,
+    Bits,
+    Channels
+    ));
   return EFI_SUCCESS;
 
 CLOSE_STREAM:
@@ -874,6 +940,14 @@ HdaCodecAudioIoStartPlaybackAsync (
                     (VOID *)Callback,
                     Context
                     );
+  DEBUG ((
+    EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
+    "HDA: StartPlaybackAsync buffer %p length 0x%X position 0x%X - %r\n",
+    Data,
+    DataLength,
+    Position,
+    Status
+    ));
   return Status;
 }
 

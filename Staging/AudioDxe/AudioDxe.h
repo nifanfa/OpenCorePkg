@@ -63,6 +63,18 @@ extern EFI_DRIVER_BINDING_PROTOCOL  gHdaControllerDriverBinding;
 extern EFI_DRIVER_BINDING_PROTOCOL  gHdaCodecDriverBinding;
 extern EFI_AUDIO_DECODE_PROTOCOL    gEfiAudioDecodeProtocol;
 
+VOID
+HdaControllerDiagnosticLogHdaIo (
+  IN EFI_HDA_IO_PROTOCOL  *HdaIo,
+  IN CONST CHAR8          *Format,
+  ...
+  );
+
+VOID
+HdaControllerDiagnosticFlushHdaIo (
+  IN EFI_HDA_IO_PROTOCOL  *HdaIo
+  );
+
 // Cannot raise TPL above this value round any code which calls gBS->SetTimer
 // (using the DxeCore implementation of it, e.g. at least OVMF).
 // REF: MdeModulePkg/Core/Dxe/Event/Timer.c

@@ -438,6 +438,7 @@ STATIC HDA_CODEC_LIST_ENTRY  mHdaCodecList[] = {
   { HDA_CODEC (REALTEK,       0x0888), 0x0000, "Realtek ALC888"                     },
   { HDA_CODEC (REALTEK,       0x0889), 0x0000, "Realtek ALC889"                     },
   { HDA_CODEC (REALTEK,       0x0892), 0x0000, "Realtek ALC892"                     },
+  { HDA_CODEC (REALTEK,       0x0897), 0x0000, "Realtek ALC897"                     },
   { HDA_CODEC (REALTEK,       0x0898), 0x0000, "Realtek ALC898"                     },
   { HDA_CODEC (REALTEK,       0x0899), 0x0000, "Realtek ALC899"                     },
   { HDA_CODEC (REALTEK,       0x0900), 0x0000, "Realtek ALC1150"                    },

@@ -91,7 +91,7 @@ typedef struct {
 
 // Buffer Descriptor List sizes. Max number of entries is 256, min is 2.
 #define HDA_BDL_ENTRY_IOC    BIT0
-#define HDA_BDL_ENTRY_COUNT  2
+#define HDA_BDL_ENTRY_COUNT  64
 #define HDA_BDL_SIZE         (sizeof(HDA_BDL_ENTRY) * HDA_BDL_ENTRY_COUNT)
 #define HDA_BDL_ENTRY_HALF   ((HDA_BDL_ENTRY_COUNT / 2) - 1)
 #define HDA_BDL_ENTRY_LAST   (HDA_BDL_ENTRY_COUNT - 1)
@@ -102,8 +102,10 @@ typedef struct {
 #define HDA_BDL_BLOCKSIZE          (HDA_STREAM_BUF_SIZE / HDA_BDL_ENTRY_COUNT)
 #define HDA_STREAM_POLL_TIME       (EFI_TIMER_PERIOD_MILLISECONDS(1))
 #define HDA_STREAM_BUFFER_PADDING  0x200  // 512 byte pad.
-
 #define HDA_STREAM_DMA_CHECK_THRESH  5
+#define HDA_DIAGNOSTIC_BUFFER_SIZE  16384
+#define HDA_DIAGNOSTIC_SAMPLE_PERIOD  10
+#define HDA_DIAGNOSTIC_FLUSH_LINES  16
 
 //
 // DMA position structure.
@@ -200,10 +202,23 @@ typedef struct {
   // Source buffer currently active?
   //
   BOOLEAN                       BufferActive;
+  // TRUE while the running ring contains only silence after an underrun.
+  BOOLEAN                       BufferSilent;
+  // HDA stream remains running while asynchronous segments are appended.
+  BOOLEAN                       StreamRunning;
+
+  // Tail of data already copied into the HDA ring and its queued byte count.
+  UINT32                        BufferWritePosition;
+  UINT32                        BufferQueuedLength;
 
   UINT32                        DmaPositionLast;
   UINT32                        DmaPositionTotal;
   UINT32                        DmaPositionChangedMax;
+  // Link position tracks bytes transferred from the controller to the codec.
+  // DMA position can be ahead of this while data is still queued in HDA.
+  UINT32                        LinkPositionLast;
+  UINT32                        LinkPositionTotal;
+  UINT32                        DiagnosticPollCount;
 
   // Timing elements for buffer filling.
   EFI_EVENT                     PollTimer;
@@ -356,6 +371,12 @@ struct _HDA_CONTROLLER_DEV {
   EFI_EVENT                           ExitBootServicesEvent;
   SPIN_LOCK                           SpinLock;
 
+  // Buffered hardware diagnostics written to AudioDxeDiagnostics.txt.
+  CHAR8                               DiagnosticBuffer[HDA_DIAGNOSTIC_BUFFER_SIZE];
+  UINTN                               DiagnosticBufferLength;
+  UINT32                              DiagnosticLineCount;
+  BOOLEAN                             DiagnosticFlushBusy;
+
   // Required quirks.
   UINTN                               Quirks;
 };
@@ -494,6 +515,13 @@ HdaControllerStreamOutputPollTimerHandler (
   IN VOID       *Context
   );
 
+VOID
+HdaControllerDiagnosticLog (
+  IN HDA_CONTROLLER_DEV  *HdaControllerDev,
+  IN CONST CHAR8         *Format,
+  ...
+  );
+
 EFI_STATUS
 EFIAPI
 HdaControllerReset (
@@ -593,6 +621,13 @@ HdaControllerSetStreamState (
 BOOLEAN
 HdaControllerGetStreamLinkPos (
   IN  HDA_STREAM  *HdaStream,
+  OUT UINT32      *Position
+  );
+
+BOOLEAN
+HdaControllerGetStreamDmaPos (
+  IN  HDA_STREAM  *HdaStream,
+  IN  UINT32      LinkPosition,
   OUT UINT32      *Position
   );
 

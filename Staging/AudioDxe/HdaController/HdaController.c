@@ -29,16 +29,165 @@
 #include <Library/OcDeviceMiscLib.h>
 #include <Library/OcDebugLogLib.h>
 #include <Library/OcDevicePathLib.h>
+#include <Library/OcFileLib.h>
 #include <Library/OcHdaDevicesLib.h>
 #include <Library/OcMiscLib.h>
 #include <Library/OcStringLib.h>
 #include <Library/PcdLib.h>
+#include <Library/PrintLib.h>
 
 BOOLEAN
   gRestoreNoSnoop = FALSE;
 
 EFI_DEVICE_PATH_PROTOCOL *
   gForcedControllerDevicePath = NULL;
+
+STATIC
+VOID
+HdaControllerDiagnosticFlush (
+  IN HDA_CONTROLLER_DEV  *HdaControllerDev
+  )
+{
+  EFI_STATUS  Status;
+
+  if (  (HdaControllerDev == NULL)
+     || (HdaControllerDev->DiagnosticBufferLength == 0)
+     || HdaControllerDev->DiagnosticFlushBusy)
+  {
+    return;
+  }
+
+  HdaControllerDev->DiagnosticFlushBusy = TRUE;
+  Status = OcSetFileData (
+             NULL,
+             L"AudioDxeDiagnostics.txt",
+             HdaControllerDev->DiagnosticBuffer,
+             (UINT32)HdaControllerDev->DiagnosticBufferLength
+             );
+  HdaControllerDev->DiagnosticFlushBusy = FALSE;
+
+  DEBUG ((
+    EFI_ERROR (Status) ? DEBUG_WARN : DEBUG_INFO,
+    "HDA: Diagnostic file flush (%u bytes) - %r\n",
+    (UINT32)HdaControllerDev->DiagnosticBufferLength,
+    Status
+    ));
+}
+
+STATIC
+VOID
+HdaControllerDiagnosticVLog (
+  IN HDA_CONTROLLER_DEV  *HdaControllerDev,
+  IN CONST CHAR8         *Format,
+  IN VA_LIST             Marker
+  )
+{
+  CHAR8  Line[256];
+  UINTN  LineLength;
+
+  if ((HdaControllerDev == NULL) || (Format == NULL)) {
+    return;
+  }
+
+  LineLength = AsciiVSPrint (Line, sizeof (Line), Format, Marker);
+  if (LineLength >= sizeof (Line)) {
+    LineLength = sizeof (Line) - 1;
+  }
+
+  if (LineLength == 0) {
+    return;
+  }
+
+  if (LineLength > sizeof (HdaControllerDev->DiagnosticBuffer) - HdaControllerDev->DiagnosticBufferLength) {
+    // Never perform filesystem I/O from a stream poll or codec command path.
+    // The buffer is intentionally bounded; retain the diagnostics already
+    // collected instead of blocking or disturbing HDA timing when full.
+    return;
+  }
+
+  CopyMem (
+    HdaControllerDev->DiagnosticBuffer + HdaControllerDev->DiagnosticBufferLength,
+    Line,
+    LineLength
+    );
+  HdaControllerDev->DiagnosticBufferLength += LineLength;
+  HdaControllerDev->DiagnosticLineCount++;
+
+}
+
+VOID
+HdaControllerDiagnosticLog (
+  IN HDA_CONTROLLER_DEV  *HdaControllerDev,
+  IN CONST CHAR8         *Format,
+  ...
+  )
+{
+  VA_LIST  Marker;
+
+  VA_START (Marker, Format);
+  HdaControllerDiagnosticVLog (HdaControllerDev, Format, Marker);
+  VA_END (Marker);
+}
+
+VOID
+HdaControllerDiagnosticLogHdaIo (
+  IN EFI_HDA_IO_PROTOCOL  *HdaIo,
+  IN CONST CHAR8          *Format,
+  ...
+  )
+{
+  HDA_IO_PRIVATE_DATA  *HdaPrivateData;
+  VA_LIST              Marker;
+
+  if (HdaIo == NULL) {
+    return;
+  }
+
+  HdaPrivateData = HDA_IO_PRIVATE_DATA_FROM_THIS (HdaIo);
+  if (HdaPrivateData == NULL) {
+    return;
+  }
+
+  VA_START (Marker, Format);
+  HdaControllerDiagnosticVLog (HdaPrivateData->HdaControllerDev, Format, Marker);
+  VA_END (Marker);
+}
+
+VOID
+HdaControllerDiagnosticFlushHdaIo (
+  IN EFI_HDA_IO_PROTOCOL  *HdaIo
+  )
+{
+  HDA_IO_PRIVATE_DATA  *HdaPrivateData;
+
+  if (HdaIo == NULL) {
+    return;
+  }
+
+  HdaPrivateData = HDA_IO_PRIVATE_DATA_FROM_THIS (HdaIo);
+  if (HdaPrivateData != NULL) {
+    HdaControllerDiagnosticFlush (HdaPrivateData->HdaControllerDev);
+  }
+}
+
+BOOLEAN
+HdaControllerGetStreamDmaPos (
+  IN  HDA_STREAM  *HdaStream,
+  IN  UINT32      LinkPosition,
+  OUT UINT32      *Position
+  )
+{
+  if ((HdaStream == NULL) || (Position == NULL)) {
+    return FALSE;
+  }
+
+  // Use LPIB for every controller. The optional DMA position buffer has
+  // different update semantics between QEMU and physical HDA controllers;
+  // using it for the ring cursor can move the producer backwards and replay
+  // samples already consumed.
+  *Position = LinkPosition;
+  return TRUE;
+}
 
 VOID
 EFIAPI
@@ -53,12 +202,19 @@ HdaControllerStreamOutputPollTimerHandler (
 
   UINT8   HdaStreamSts;
   UINT32  HdaStreamDmaPos;
+  UINT32  HdaStreamLinkPos;
   UINT32  HdaSourceLength;
   UINT32  HdaCurrentBlock;
   UINT32  HdaNextBlock;
 
   UINT32  DmaChanged;
+  UINT32  LinkChanged;
   UINT32  Tmp;
+
+  EFI_HDA_IO_STREAM_CALLBACK  Callback;
+  VOID                        *CallbackContext1;
+  VOID                        *CallbackContext2;
+  VOID                        *CallbackContext3;
 
   HdaStream    = (HDA_STREAM *)Context;
   PciIo        = HdaStream->HdaDev->PciIo;
@@ -68,54 +224,47 @@ HdaControllerStreamOutputPollTimerHandler (
   // Get current stream status bits.
   //
   Status = PciIo->Mem.Read (PciIo, EfiPciIoWidthFifoUint8, PCI_HDA_BAR, HDA_REG_SDNSTS (HdaStream->Index), 1, &HdaStreamSts);
-  if (EFI_ERROR (Status) || ((HdaStreamSts & (HDA_REG_SDNSTS_FIFOE | HDA_REG_SDNSTS_DESE)) != 0)) {
+  if (EFI_ERROR (Status)) {
+    HdaControllerDiagnosticLog (
+      HdaStream->HdaDev,
+      "poll stream=%u SDNSTS read_status=0x%08X\n",
+      HdaStream->Index,
+      (UINT32)Status
+      );
     HdaControllerStreamAbort (HdaStream);
     return;
   }
 
-  if (HdaStream->UseLpib) {
-    //
-    // Get stream position through LPIB register.
-    //
-    Status = PciIo->Mem.Read (PciIo, EfiPciIoWidthFifoUint32, PCI_HDA_BAR, HDA_REG_SDNLPIB (HdaStream->Index), 1, &HdaStreamDmaPos);
-    if (EFI_ERROR (Status)) {
-      HdaControllerStreamAbort (HdaStream);
-      return;
-    }
-  } else {
-    //
-    // Get stream position through DMA positions buffer.
-    //
-    HdaStreamDmaPos = HdaStream->HdaDev->DmaPositions[HdaStream->Index].Position;
-
-    //
-    // If zero, give the stream a few cycles to catch up before falling back to LPIB.
-    // Fallback occurs after the set amount of cycles the DMA position is zero.
-    //
-    if ((HdaStreamDmaPos == 0) && !HdaStream->DmaCheckComplete) {
-      if (HdaStream->DmaCheckCount >= HDA_STREAM_DMA_CHECK_THRESH) {
-        HdaStream->UseLpib = TRUE;
-      }
-
-      //
-      // Get stream position through LPIB register in the meantime.
-      //
-      DEBUG ((DEBUG_VERBOSE, "AudioDxe: Falling back to LPIB after %u more tries!\n", HDA_STREAM_DMA_CHECK_THRESH - HdaStream->DmaCheckCount));
-      Status = PciIo->Mem.Read (PciIo, EfiPciIoWidthFifoUint32, PCI_HDA_BAR, HDA_REG_SDNLPIB (HdaStream->Index), 1, &HdaStreamDmaPos);
-      if (EFI_ERROR (Status)) {
-        HdaControllerStreamAbort (HdaStream);
-        return;
-      }
-    }
+  if ((HdaStreamSts & (HDA_REG_SDNSTS_FIFOE | HDA_REG_SDNSTS_DESE)) != 0) {
+    HdaControllerDiagnosticLog (
+      HdaStream->HdaDev,
+      "poll stream=%u SDNSTS=0x%02X FIFOE=%u DESE=%u\n",
+      HdaStream->Index,
+      HdaStreamSts,
+      (HdaStreamSts & HDA_REG_SDNSTS_FIFOE) != 0,
+      (HdaStreamSts & HDA_REG_SDNSTS_DESE) != 0
+      );
+    HdaControllerStreamAbort (HdaStream);
+    return;
   }
 
-  //
-  // Increment cycle counter. Once complete, store status to avoid false fallbacks later on.
-  //
-  if (HdaStream->DmaCheckCount < HDA_STREAM_DMA_CHECK_THRESH) {
-    HdaStream->DmaCheckCount++;
-  } else {
-    HdaStream->DmaCheckComplete = TRUE;
+  // Use LPIB as the single playback position on both QEMU and physical HDA.
+  Status = PciIo->Mem.Read (
+                        PciIo,
+                        EfiPciIoWidthFifoUint32,
+                        PCI_HDA_BAR,
+                        HDA_REG_SDNLPIB (HdaStream->Index),
+                        1,
+                        &HdaStreamLinkPos
+                        );
+  if (EFI_ERROR (Status)) {
+    HdaControllerStreamAbort (HdaStream);
+    return;
+  }
+
+  if (!HdaControllerGetStreamDmaPos (HdaStream, HdaStreamLinkPos, &HdaStreamDmaPos)) {
+    HdaControllerStreamAbort (HdaStream);
+    return;
   }
 
   if (HdaStreamDmaPos >= HdaStream->DmaPositionLast) {
@@ -126,27 +275,99 @@ HdaControllerStreamOutputPollTimerHandler (
 
   HdaStream->DmaPositionLast = HdaStreamDmaPos;
 
+  if (HdaStreamLinkPos >= HdaStream->LinkPositionLast) {
+    LinkChanged = HdaStreamLinkPos - HdaStream->LinkPositionLast;
+  } else {
+    LinkChanged = (HDA_STREAM_BUF_SIZE - HdaStream->LinkPositionLast) + HdaStreamLinkPos;
+  }
+
+  HdaStream->LinkPositionLast = HdaStreamLinkPos;
+
+  if (++HdaStream->DiagnosticPollCount >= HDA_DIAGNOSTIC_SAMPLE_PERIOD) {
+    HdaStream->DiagnosticPollCount = 0;
+    HdaControllerDiagnosticLog (
+      HdaStream->HdaDev,
+      "poll stream=%u SDNSTS=0x%02X LPIB=0x%08X DMA=0x%08X DMA_DELTA=0x%08X LPIB_DELTA=0x%08X queued=0x%08X\n",
+      HdaStream->Index,
+      HdaStreamSts,
+      HdaStreamLinkPos,
+      HdaStreamDmaPos,
+      DmaChanged,
+      LinkChanged,
+      HdaStream->BufferQueuedLength
+      );
+  }
+
+  // Keep accounting the bytes already copied into the DMA ring even after a
+  // source callback has been delivered.  BufferActive only describes the
+  // callback-owned source segment; the queued tail can still be draining.
+  // Without this, an asynchronous stream with no replacement segment leaves
+  // the HDA engine running against the old circular BDL and replays it.
+  if (HdaStream->BufferQueuedLength > 0) {
+    if (LinkChanged >= HdaStream->BufferQueuedLength) {
+      HdaStream->BufferQueuedLength = 0;
+    } else {
+      HdaStream->BufferQueuedLength -= LinkChanged;
+    }
+  }
+
   if (HdaStream->BufferActive) {
+
     if (BaseOverflowAddU32 (HdaStream->DmaPositionTotal, DmaChanged, &HdaStream->DmaPositionTotal)) {
       HdaControllerStreamAbort (HdaStream);
       return;
     }
 
-    //
-    // Padding added to account for delay between DMA transfer to controller and actual playback.
-    //
-    if (HdaStream->DmaPositionTotal > HdaStream->BufferSourceLength + HDA_STREAM_BUFFER_PADDING) {
-      DEBUG ((DEBUG_VERBOSE, "AudioDxe: Completed playback of 0x%X buffer with 0x%X bytes read, current DMA: 0x%X\n", HdaStream->BufferSourceLength, HdaStream->DmaPositionTotal, HdaStreamDmaPos));
-      HdaControllerStreamIdle (HdaStream);
-
-      //
-      // TODO: Remove when continous stream run is implemented.
-      //
+    if (BaseOverflowAddU32 (HdaStream->LinkPositionTotal, LinkChanged, &HdaStream->LinkPositionTotal)) {
       HdaControllerStreamAbort (HdaStream);
+      return;
+    }
 
-      if (HdaStream->Callback != NULL) {
-        HdaStream->Callback (EfiHdaIoTypeOutput, HdaStream->CallbackContext1, HdaStream->CallbackContext2, HdaStream->CallbackContext3);
+    // BufferQueuedLength includes any tail appended by an earlier callback,
+    // so completion must be based on the active source segment itself.  Do
+    // not subtract a fixed lead here: the callback is the producer's only
+    // acknowledgement that this segment has been consumed, and firing it
+    // early causes the next append to overwrite the still-playing tail.
+    if (HdaStream->LinkPositionTotal >= HdaStream->BufferSourceLength) {
+      DEBUG ((DEBUG_VERBOSE, "AudioDxe: Completed playback of 0x%X buffer with 0x%X bytes read, current DMA: 0x%X\n", HdaStream->BufferSourceLength, HdaStream->DmaPositionTotal, HdaStreamDmaPos));
+
+      // Consume the callback before stopping the stream.  The callback is a
+      // completion notification for this transfer and must not remain armed
+      // while the caller starts the next transfer from inside the callback.
+      Callback        = HdaStream->Callback;
+      CallbackContext1 = HdaStream->CallbackContext1;
+      CallbackContext2 = HdaStream->CallbackContext2;
+      CallbackContext3 = HdaStream->CallbackContext3;
+      HdaStream->Callback             = NULL;
+      HdaStream->CallbackContext1     = NULL;
+      HdaStream->CallbackContext2     = NULL;
+      HdaStream->CallbackContext3     = NULL;
+
+      // Synchronous StartPlayback has no user callback and still expects the
+      // stream to stop.  Asynchronous playback is a FIFO: leave the HDA
+      // engine and its polling timer running so the next StartStream call can
+      // append data without dropping the codec FIFO.
+      if (CallbackContext2 == NULL) {
+        HdaControllerStreamAbort (HdaStream);
+      } else {
+        // BufferQueuedLength is the actual number of bytes still ahead of
+        // the codec.  Keep the accumulated value across hand-offs; resetting
+        // it to the completion lead loses backlog whenever the poll/callback
+        // cadence is even slightly slower than the source cadence and lets
+        // the write tail lap the playback head after a ring wrap.
+        HdaStream->BufferActive         = FALSE;
+        HdaStream->BufferSource         = NULL;
+        HdaStream->BufferSourceLength   = 0;
+        HdaStream->BufferSourcePosition = 0;
       }
+
+      if (Callback != NULL) {
+        Callback (EfiHdaIoTypeOutput, CallbackContext1, CallbackContext2, CallbackContext3);
+      }
+
+      // A completion callback may append another transfer immediately.  Do
+      // not let this timer invocation operate on the new transfer's state.
+      return;
     }
 
     //
@@ -190,6 +411,21 @@ HdaControllerStreamOutputPollTimerHandler (
         HdaStream->BufferSourcePosition
         ));
     }
+  }
+
+  // Keep the HDA stream alive across producer gaps.  Once all queued audio has
+  // crossed the link, clear the ring once and follow the current link position
+  // as the write tail.  New audio can then be appended at the position the
+  // controller is currently reading instead of replaying old ring contents.
+  if (HdaStream->StreamRunning &&
+      !HdaStream->BufferActive &&
+      HdaStream->BufferQueuedLength == 0) {
+    if (!HdaStream->BufferSilent) {
+      ZeroMem (HdaStream->BufferData, HDA_STREAM_BUF_SIZE);
+      HdaStream->BufferSilent = TRUE;
+    }
+
+    HdaStream->BufferWritePosition = HdaStreamLinkPos;
   }
 
   //
@@ -733,7 +969,7 @@ START:
       // DEBUG((DEBUG_INFO, "old RP: 0x%X\n", HdaCorbReadPointer));
 
       // Add verbs to CORB until all of them are added or the CORB becomes full.
-      while (RemainingVerbs && ((HdaDev->Corb.Pointer + 1 % HdaDev->Corb.EntryCount) != HdaCorbReadPointer)) {
+      while (RemainingVerbs && (((HdaDev->Corb.Pointer + 1) % HdaDev->Corb.EntryCount) != HdaCorbReadPointer)) {
         // Move write pointer and write verb to CORB.
         HdaDev->Corb.Pointer++;
         HdaDev->Corb.Pointer         %= HdaDev->Corb.EntryCount;

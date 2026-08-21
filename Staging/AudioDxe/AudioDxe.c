@@ -31,6 +31,7 @@
 #include <Protocol/LoadedImage.h>
 #include <Library/OcBootManagementLib.h>
 #include <Library/OcFlexArrayLib.h>
+#include <Library/OcDriverConnectionLib.h>
 
 /**
   HdaController Driver Binding.
@@ -130,6 +131,12 @@ AudioDxeInit (
     gCodecUseConnNoneNode,
     gCodecSetupDelay
     ));
+
+  // A firmware HDA driver may already own the Intel controller.  Disconnect
+  // all HDA controllers before installing this binding so the subsequent
+  // ConnectController pass can bind AudioDxe to the onboard codec as well as
+  // any GPU HDMI codecs.
+  OcDisconnectHdaControllers ();
 
   //
   // Register HdaController Driver Binding.

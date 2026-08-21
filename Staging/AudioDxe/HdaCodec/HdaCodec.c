@@ -762,6 +762,19 @@ HdaCodecProbeFuncGroup (
         // This can be gotten using the node ID of the connection minus our starting node ID.
         UINT16  WidgetIndex = HdaWidget->Connections[c] - WidgetStart;
 
+        // Do not trust a malformed connection list with an out-of-bounds
+        // widget index while the codec is coming out of reset.
+        if (WidgetIndex >= WidgetCount) {
+          DEBUG ((
+            DEBUG_WARN,
+            "HDA: Widget @ 0x%X has invalid connection 0x%X\n",
+            HdaWidget->NodeId,
+            HdaWidget->Connections[c]
+            ));
+          HdaWidget->WidgetConnections[c] = NULL;
+          continue;
+        }
+
         // Save pointer to widget.
         HdaConnectedWidget = FuncGroup->Widgets + WidgetIndex;
         // DEBUG((DEBUG_INFO, "Widget @ 0x%X found connection to index %u (0x%X, type 0x%X)\n",
@@ -813,6 +826,13 @@ HdaCodecProbeCodec (
   if (EFI_ERROR (Status)) {
     return Status;
   }
+
+  HdaControllerDiagnosticLogHdaIo (
+    HdaIo,
+    "codec vendor=0x%08X revision_id=0x%08X\n",
+    HdaCodecDev->VendorId,
+    HdaCodecDev->RevisionId
+    );
 
   // Try to match codec name.
   HdaCodecDev->Name = AsciiStrCopyToUnicode (OcHdaCodecGetName (HdaCodecDev->VendorId, (UINT16)HdaCodecDev->RevisionId), 0);
@@ -889,6 +909,9 @@ HdaCodecFindUpstreamOutput (
   for (UINT8 c = 0; c < HdaWidget->ConnectionCount; c++) {
     // Get connected widget.
     HdaConnectedWidget = HdaWidget->WidgetConnections[c];
+    if (HdaConnectedWidget == NULL) {
+      continue;
+    }
     DEBUG ((
       DEBUG_INFO,
       "HDA:  | %*aWidget @ 0x%X (type 0x%X)\n",
@@ -932,135 +955,156 @@ HdaCodecParsePorts (
   UINT8                DefaultDeviceType;
   UINT32               Response;
   BOOLEAN              IsOutput;
+  BOOLEAN              IsRealtekAlc897;
+  BOOLEAN              RelaxedPinFilter;
+  BOOLEAN              UsePinCapsForOutputs;
 
   // DEBUG((DEBUG_INFO, "HdaCodecParsePorts(): start\n"));
 
   HdaIo = HdaCodecDev->HdaIo;
+  IsRealtekAlc897 = (HdaCodecDev->VendorId == (UINT32) ((VEN_REALTEK_ID << 16) | 0x0897));
+  UsePinCapsForOutputs = PcdGetBool (PcdAudioControllerUsePinCapsForOutputs);
 
-  // Loop through each function group.
-  for (UINT8 f = 0; f < HdaCodecDev->FuncGroupsCount; f++) {
-    // Get function group.
-    HdaFuncGroup = HdaCodecDev->FuncGroups + f;
+  // ALC897 boards commonly rely on firmware/AppleALC pin verbs to mark the
+  // analog output association.  If firmware leaves association/connection
+  // metadata incomplete, the normal filter below can hide every real output.
+  // Only enable the fallback for this codec and only after the normal pass
+  // found no output ports.
+  RelaxedPinFilter = FALSE;
 
-    // Loop through each widget.
-    for (UINT8 w = 0; w < HdaFuncGroup->WidgetsCount; w++) {
-      // Get widget.
-      HdaWidget = HdaFuncGroup->Widgets + w;
+  for (UINT8 Pass = 0; Pass < 2; Pass++) {
+    if ((Pass == 1) && (!IsRealtekAlc897 || (HdaCodecDev->OutputPortsCount != 0))) {
+      break;
+    }
 
-      // Is the widget a pin complex? If not, ignore it.
-      // If this is a pin complex but it has no connection to a port, also ignore it.
-      // If the default association for the pin complex is zero, also ignore it.
-      if ((HdaWidget->Type != HDA_WIDGET_TYPE_PIN_COMPLEX) ||
-          (!gCodecUseConnNoneNode && (HDA_VERB_GET_CONFIGURATION_DEFAULT_PORT_CONN (HdaWidget->DefaultConfiguration) == HDA_CONFIG_DEFAULT_PORT_CONN_NONE)) ||
-          (HDA_VERB_GET_CONFIGURATION_DEFAULT_ASSOCIATION (HdaWidget->DefaultConfiguration) == 0))
-      {
-        DEBUG ((
-          DEBUG_VERBOSE,
-          "HDA:  | Ignoring widget @ 0x%X\n",
-          HdaWidget->NodeId
-          ));
-        continue;
-      }
+    RelaxedPinFilter = (Pass == 1);
 
-      if (PcdGetBool (PcdAudioControllerUsePinCapsForOutputs)) {
-        // Use PinCaps to identify all pin complexes which can be configured as outputs.
-        // On certain systes, e.g. MacPro5,1, ports which are inputs according to default
-        // type are the correct output channels to use on the system.
-        IsOutput = (HdaWidget->PinCapabilities & HDA_PARAMETER_PIN_CAPS_OUTPUT) != 0;
-      } else {
-        // Determine if port is an output based on the default device type.
-        // The types reported here do not correspond particularly well to the real hardware.
-        DefaultDeviceType = HDA_VERB_GET_CONFIGURATION_DEFAULT_DEVICE (HdaWidget->DefaultConfiguration);
+    // Loop through each function group.
+    for (UINT8 f = 0; f < HdaCodecDev->FuncGroupsCount; f++) {
+      // Get function group.
+      HdaFuncGroup = HdaCodecDev->FuncGroups + f;
 
-        IsOutput = (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_LINE_OUT)
-                   || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_SPEAKER)
-                   || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_HEADPHONE_OUT)
-                   || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_SPDIF_OUT)
-                   || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_OTHER_DIGITAL_OUT);
-      }
+      // Loop through each widget.
+      for (UINT8 w = 0; w < HdaFuncGroup->WidgetsCount; w++) {
+        // Get widget.
+        HdaWidget = HdaFuncGroup->Widgets + w;
 
-      if (IsOutput) {
-        // Try to get upstream output.
-        Status = HdaCodecFindUpstreamOutput (HdaWidget, 0);
-        if (EFI_ERROR (Status)) {
+        // Is the widget a pin complex? If not, ignore it.
+        // If this is a pin complex but it has no connection to a port, also ignore it.
+        // If the default association for the pin complex is zero, also ignore it.
+        if ((HdaWidget->Type != HDA_WIDGET_TYPE_PIN_COMPLEX) ||
+            (!RelaxedPinFilter && !(UsePinCapsForOutputs && IsRealtekAlc897) && !gCodecUseConnNoneNode && (HDA_VERB_GET_CONFIGURATION_DEFAULT_PORT_CONN (HdaWidget->DefaultConfiguration) == HDA_CONFIG_DEFAULT_PORT_CONN_NONE)) ||
+            (!RelaxedPinFilter && !(UsePinCapsForOutputs && IsRealtekAlc897) && (HDA_VERB_GET_CONFIGURATION_DEFAULT_ASSOCIATION (HdaWidget->DefaultConfiguration) == 0)) ||
+            (RelaxedPinFilter && ((HdaWidget->PinCapabilities & HDA_PARAMETER_PIN_CAPS_OUTPUT) == 0)))
+        {
           DEBUG ((
-            DEBUG_WARN,
-            "HDA: Widget @ 0x%X find upstream output - %r\n",
-            HdaWidget->NodeId,
-            Status
+            DEBUG_VERBOSE,
+            "HDA:  | Ignoring widget @ 0x%X\n",
+            HdaWidget->NodeId
             ));
           continue;
         }
 
-        // Report output.
-        DEBUG ((
-          DEBUG_INFO,
-          "HDA:  | Port widget @ 0x%X is an output (pin defaults 0x%X) (bitmask %u)\n",
-          HdaWidget->NodeId,
-          HdaWidget->DefaultConfiguration,
-          1 << HdaCodecDev->OutputPortsCount
-          ));
+        if (RelaxedPinFilter || UsePinCapsForOutputs) {
+          // Use PinCaps to identify all pin complexes which can be configured as outputs.
+          // On certain systes, e.g. MacPro5,1, ports which are inputs according to default
+          // type are the correct output channels to use on the system.
+          IsOutput = (HdaWidget->PinCapabilities & HDA_PARAMETER_PIN_CAPS_OUTPUT) != 0;
+        } else {
+          // Determine if port is an output based on the default device type.
+          // The types reported here do not correspond particularly well to the real hardware.
+          DefaultDeviceType = HDA_VERB_GET_CONFIGURATION_DEFAULT_DEVICE (HdaWidget->DefaultConfiguration);
 
-        // If EAPD is present, enable.
-        if (HdaWidget->PinCapabilities & HDA_PARAMETER_PIN_CAPS_EAPD) {
-          // Get current EAPD setting.
-          Status = HdaIo->SendCommand (HdaIo, HdaWidget->NodeId, HDA_CODEC_VERB (HDA_VERB_GET_EAPD_BTL_ENABLE, 0), &Response);
+          IsOutput = (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_LINE_OUT)
+                     || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_SPEAKER)
+                     || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_HEADPHONE_OUT)
+                     || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_SPDIF_OUT)
+                     || (DefaultDeviceType == HDA_CONFIG_DEFAULT_DEVICE_OTHER_DIGITAL_OUT);
+        }
+
+        if (IsOutput) {
+          // Try to get upstream output.
+          Status = HdaCodecFindUpstreamOutput (HdaWidget, 0);
           if (EFI_ERROR (Status)) {
-            return Status;
+            DEBUG ((
+              DEBUG_WARN,
+              "HDA: Widget @ 0x%X find upstream output - %r\n",
+              HdaWidget->NodeId,
+              Status
+              ));
+            continue;
           }
 
-          // If the EAPD is not set, set it.
-          if (!(Response & HDA_EAPD_BTL_ENABLE_EAPD)) {
-            Response |= HDA_EAPD_BTL_ENABLE_EAPD;
-            Status    = HdaIo->SendCommand (
-                                 HdaIo,
-                                 HdaWidget->NodeId,
-                                 HDA_CODEC_VERB (
-                                   HDA_VERB_SET_EAPD_BTL_ENABLE,
-                                   (UINT8)Response
-                                   ),
-                                 &Response
-                                 );
+          // Report output.
+          DEBUG ((
+            DEBUG_INFO,
+            "HDA:  | Port widget @ 0x%X is an output (pin defaults 0x%X) (bitmask %u)\n",
+            HdaWidget->NodeId,
+            HdaWidget->DefaultConfiguration,
+            1 << HdaCodecDev->OutputPortsCount
+            ));
+
+          // If EAPD is present, enable.
+          if (HdaWidget->PinCapabilities & HDA_PARAMETER_PIN_CAPS_EAPD) {
+            // Get current EAPD setting.
+            Status = HdaIo->SendCommand (HdaIo, HdaWidget->NodeId, HDA_CODEC_VERB (HDA_VERB_GET_EAPD_BTL_ENABLE, 0), &Response);
+            if (EFI_ERROR (Status)) {
+              return Status;
+            }
+
+            // If the EAPD is not set, set it.
+            if (!(Response & HDA_EAPD_BTL_ENABLE_EAPD)) {
+              Response |= HDA_EAPD_BTL_ENABLE_EAPD;
+              Status    = HdaIo->SendCommand (
+                                   HdaIo,
+                                   HdaWidget->NodeId,
+                                   HDA_CODEC_VERB (
+                                     HDA_VERB_SET_EAPD_BTL_ENABLE,
+                                     (UINT8)Response
+                                     ),
+                                   &Response
+                                   );
+              if (EFI_ERROR (Status)) {
+                return Status;
+              }
+            }
+          }
+
+          // If the output amp supports muting, unmute.
+          if (HdaWidget->AmpOutCapabilities & HDA_PARAMETER_AMP_CAPS_MUTE) {
+            UINT8  offset = HDA_PARAMETER_AMP_CAPS_OFFSET (HdaWidget->AmpOutCapabilities); // TODO set volume.
+
+            // If there are no overriden amp capabilities, check function group.
+            if (!(HdaWidget->AmpOverride)) {
+              offset = HDA_PARAMETER_AMP_CAPS_OFFSET (HdaWidget->FuncGroup->AmpOutCapabilities);
+            }
+
+            // Unmute amp.
+            Status = HdaIo->SendCommand (
+                              HdaIo,
+                              HdaWidget->NodeId,
+                              HDA_CODEC_VERB (
+                                HDA_VERB_SET_AMP_GAIN_MUTE,
+                                HDA_VERB_SET_AMP_GAIN_MUTE_PAYLOAD (0, offset, FALSE, TRUE, TRUE, FALSE, TRUE)
+                                ),
+                              &Response
+                              );
             if (EFI_ERROR (Status)) {
               return Status;
             }
           }
-        }
 
-        // If the output amp supports muting, unmute.
-        if (HdaWidget->AmpOutCapabilities & HDA_PARAMETER_AMP_CAPS_MUTE) {
-          UINT8  offset = HDA_PARAMETER_AMP_CAPS_OFFSET (HdaWidget->AmpOutCapabilities); // TODO set volume.
-
-          // If there are no overriden amp capabilities, check function group.
-          if (!(HdaWidget->AmpOverride)) {
-            offset = HDA_PARAMETER_AMP_CAPS_OFFSET (HdaWidget->FuncGroup->AmpOutCapabilities);
+          // Reallocate output array.
+          HdaCodecDev->OutputPorts = ReallocatePool (sizeof (HDA_WIDGET_DEV *) * HdaCodecDev->OutputPortsCount, sizeof (HDA_WIDGET_DEV *) * (HdaCodecDev->OutputPortsCount + 1), HdaCodecDev->OutputPorts);
+          if (HdaCodecDev->OutputPorts == NULL) {
+            return EFI_OUT_OF_RESOURCES;
           }
 
-          // Unmute amp.
-          Status = HdaIo->SendCommand (
-                            HdaIo,
-                            HdaWidget->NodeId,
-                            HDA_CODEC_VERB (
-                              HDA_VERB_SET_AMP_GAIN_MUTE,
-                              HDA_VERB_SET_AMP_GAIN_MUTE_PAYLOAD (0, offset, FALSE, TRUE, TRUE, FALSE, TRUE)
-                              ),
-                            &Response
-                            );
-          if (EFI_ERROR (Status)) {
-            return Status;
-          }
+          HdaCodecDev->OutputPortsCount++;
+
+          // Add widget to output array.
+          HdaCodecDev->OutputPorts[HdaCodecDev->OutputPortsCount - 1] = HdaWidget;
         }
-
-        // Reallocate output array.
-        HdaCodecDev->OutputPorts = ReallocatePool (sizeof (HDA_WIDGET_DEV *) * HdaCodecDev->OutputPortsCount, sizeof (HDA_WIDGET_DEV *) * (HdaCodecDev->OutputPortsCount + 1), HdaCodecDev->OutputPorts);
-        if (HdaCodecDev->OutputPorts == NULL) {
-          return EFI_OUT_OF_RESOURCES;
-        }
-
-        HdaCodecDev->OutputPortsCount++;
-
-        // Add widget to output array.
-        HdaCodecDev->OutputPorts[HdaCodecDev->OutputPortsCount - 1] = HdaWidget;
       }
     }
   }
